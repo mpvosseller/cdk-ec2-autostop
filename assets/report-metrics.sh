@@ -1,28 +1,27 @@
 #!/bin/bash
+
+# Publish a CloudWatch metric to report whether this instance should be considered active or not.
+# We consider it active when there are any open SSH or Session Manager connections to it or if it
+# was recently booted.
+
 availabilityZone=$(curl -s http://169.254.169.254/latest/meta-data/placement/availability-zone)
 region=$(echo "${availabilityZone}" | sed 's/[a-z]$//')
 instanceId=$(curl -s http://169.254.169.254/latest/meta-data/instance-id)
 stackName=$(aws --region "${region}" ec2 describe-instances --instance-id "${instanceId}" --query 'Reservations[*].Instances[*].Tags[?Key==`aws:cloudformation:stack-name`].Value' | jq -r '.[0][0][0]')
 uptimeSeconds=$(cat /proc/uptime | awk -F '.' '{print $1}')
 uptimeMinutes=$((uptimeSeconds / 60))
+ssmConnectionCount=$(aws ssm describe-sessions --filters "key=Target,value=${instanceId}" --state Active --region "${region}" | jq '.Sessions | length')
+sshConnectionCount=$(/usr/sbin/ss -o state established '( sport = :ssh )' | grep -i ssh | wc -l)
+((totalConnectionCount = ssmConnectionCount + sshConnectionCount))
 
-# count the ssm and ssh connections
-# note that an "ssh over ssm" connecton will be counted twice (once as an ssm connection and once as an ssh connection)
-ssmSessionCount=$(aws ssm describe-sessions --filters "key=Target,value=${instanceId}" --state Active --region "${region}" | jq '.Sessions | length')
-sshSessionCount=$(/usr/sbin/ss -o state established '( sport = :ssh )' | grep -i ssh | wc -l)
-((sessionCount = ssmSessionCount + sshSessionCount))
+# note that "ssh over ssm" connections are double counted
 
-# consider this host active if there are any sessions OR if it was booted less than 15 minutes ago
-bastionActive=0
-if [ "${sessionCount}" -gt 0 ] || [ "${uptimeMinutes}" -lt 15 ]; then
-    bastionActive=1
+isActive=0
+if [ "${totalConnectionCount}" -gt 0 ] || [ "${uptimeMinutes}" -lt 15 ]; then
+    isActive=1
 fi
 
-# Ideally a CloudWatch Alarm would decide for itself whether a host is active or not
-# by using a math expression metric with sessionCount & uptimeSeconds. Unfortunately
-# EC2 alarm actions do not currently work with expression metrics.
-# https://github.com/aws/aws-cdk/blob/master/packages/%40aws-cdk/aws-cloudwatch/lib/alarm.ts#L249
-# Instead we calculate Active in this script and publish that for the alarm to use.
-aws --region "${region}" cloudwatch put-metric-data --metric-name SessionCount --dimensions InstanceId="${instanceId}" --namespace "${stackName}" --value "${sessionCount}"
-aws --region "${region}" cloudwatch put-metric-data --metric-name UptimeMinutes --dimensions InstanceId="${instanceId}" --namespace "${stackName}" --value "${uptimeMinutes}"
-aws --region "${region}" cloudwatch put-metric-data --metric-name Active --dimensions InstanceId="${instanceId}" --namespace "${stackName}" --value "${bastionActive}"
+metricNameSpace="${stackName}"
+aws --region "${region}" cloudwatch put-metric-data --metric-name "ConnectionCount" --dimensions InstanceId="${instanceId}" --namespace "${metricNameSpace}" --value "${totalConnectionCount}"
+aws --region "${region}" cloudwatch put-metric-data --metric-name "UptimeMinutes" --dimensions InstanceId="${instanceId}" --namespace "${metricNameSpace}" --value "${uptimeMinutes}"
+aws --region "${region}" cloudwatch put-metric-data --metric-name "Active" --dimensions InstanceId="${instanceId}" --namespace "${metricNameSpace}" --value "${isActive}"
